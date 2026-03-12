@@ -1,0 +1,3 @@
+I restructured the code by organizing functions into logical groups (construction, player management, state strings, and move generation) for better maintainability after adding the pawn moves and lists with bit shifts (although I don't know if it's still right). I also tried to create move validation to distinguish between drag-and-drop phases, preventing immediate piece placement and duplicate piece creation during gameplay.
+
+I tried to improve the chess AI by adding a proper board evaluation function that considers piece positions, pawn structure, and king safety, and fixed the piece notation system to correctly generate valid board states so the AI now plays real chess moves instead of random illegal ones.

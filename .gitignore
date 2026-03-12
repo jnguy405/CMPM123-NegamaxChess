@@ -1,0 +1,54 @@
+# Ignore build output directories
+build/
+Debug/
+demo.dir/
+Testing/
+x64/
+
+# Ignore VS Code settings and workspace files
+.vscode/
+*.code-workspace
+
+# Ignore macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Ignore CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.vcxproj
+*.vcxproj.filters
+*.sln
+
+# Ignore application binaries
+*.exe
+*.dll
+*.so
+*.dylib
+*.app
+*.out
+
+# Ignore log files
+*.log
+
+# Ignore image cache/thumbnails
+Thumbs.db
+
+# Ignore ImGui config
+imgui.ini
+
+# Ignore chess piece images (if not source)
+chess/*.png
+
+# Ignore other temp files
+*.tmp
+*.bak
+*.swp
+*.swo
