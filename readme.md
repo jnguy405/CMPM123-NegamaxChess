@@ -1,5 +1,7 @@
 ## CMPM123 Negamax Chess (Bitboards + ImGui)
 
+Continatuion of [CMPM123 - Chess](https://github.com/jnguy405/CMPM123-chess) forked from Graeme Devine.
+
 This project is a chess game with an AI based on Negamax + alpha-beta pruning. The engine uses bitboards for fast move generation and evaluation, and uses ImGui for the UI (board display, AI controls, logging, and a small in-app command line).
 
 ---
