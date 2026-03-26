@@ -1,0 +1,5 @@
+I restructured the code by organizing functions into logical groups (construction, player management, state strings, and move generation) for better maintainability after adding the pawn moves and lists with bit shifts (although I don't know if it's still right). I also tried to create move validation to distinguish between drag-and-drop phases, preventing immediate piece placement and duplicate piece creation during gameplay.
+
+I tried to improve the chess AI by adding a proper board evaluation function that considers piece positions, pawn structure, and king safety, and fixed the piece notation system to correctly generate valid board states so the AI now plays real chess moves instead of random illegal ones.
+
+Looked into legal move generation such as en passant, castling, and promotions -- ai appears to prioritize centers well, but still run into repetition states. I think bitboards and string management is handled fairly, but I might be missing something as I don't play or know Chess well. As far as I have found, there are 50-move and repeat-move rules in Chess competitions so that is next.
