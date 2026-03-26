@@ -84,15 +84,28 @@ struct BitMove {
     uint8_t from;
     uint8_t to;
     uint8_t piece;
+    uint8_t promotion;
+    uint8_t flags;
+
+    enum MoveFlags : uint8_t {
+        MoveNone = 0,
+        MoveCapture = 1 << 0,
+        MoveCastleKingSide = 1 << 1,
+        MoveCastleQueenSide = 1 << 2,
+        MoveEnPassant = 1 << 3,
+        MovePromotion = 1 << 4
+    };
     
-    BitMove(int from, int to, ChessPiece piece)
-        : from(from), to(to), piece(piece) { }
+    BitMove(int from, int to, ChessPiece piece, ChessPiece promotionPiece = NoPiece, uint8_t moveFlags = MoveNone)
+        : from(from), to(to), piece(piece), promotion(promotionPiece), flags(moveFlags) { }
         
-    BitMove() : from(0), to(0), piece(NoPiece) { }
+    BitMove() : from(0), to(0), piece(NoPiece), promotion(NoPiece), flags(MoveNone) { }
     
     bool operator==(const BitMove& other) const {
         return from == other.from && 
                to == other.to && 
-               piece == other.piece;
+               piece == other.piece &&
+               promotion == other.promotion &&
+               flags == other.flags;
     }
 };

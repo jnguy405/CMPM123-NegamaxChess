@@ -63,6 +63,7 @@ namespace ClassGame {
                 // Special handling for Chess to set AI depth
                 Chess* chessGame = dynamic_cast<Chess*>(game);
                 if (chessGame) {
+                    chessGame->setSearchDepth(chessAIDepth);
                     if (selectedGameMode == MODE_HUMAN_VS_AI) {
                         chessGame->setAIPlayer(aiPlayerNumber - 1);
                         game->getPlayerAt(aiPlayerNumber - 1)->setAIPlayer(true);
@@ -138,6 +139,7 @@ namespace ClassGame {
             // Special handling for Chess
             Chess* chessGame = dynamic_cast<Chess*>(game);
             if (chessGame) {
+                chessGame->setSearchDepth(chessAIDepth);
                 chessGame->setAIPlayer(0); // AI plays as white in AI vs AI
                 game->getPlayerAt(0)->setAIPlayer(true);
                 game->getPlayerAt(1)->setAIPlayer(true);
@@ -154,6 +156,7 @@ namespace ClassGame {
             // Special handling for Chess
             Chess* chessGame = dynamic_cast<Chess*>(game);
             if (chessGame) {
+                chessGame->setSearchDepth(chessAIDepth);
                 chessGame->setAIPlayer(aiPlayerNumber - 1);
                 game->getPlayerAt(aiPlayerNumber - 1)->setAIPlayer(true);
                 game->getPlayerAt((aiPlayerNumber % 2))->setAIPlayer(false);
@@ -173,6 +176,7 @@ namespace ClassGame {
             // Special handling for Chess
             Chess* chessGame = dynamic_cast<Chess*>(game);
             if (chessGame) {
+                chessGame->setSearchDepth(chessAIDepth);
                 chessGame->setAIPlayer(-1);
             }
             
@@ -380,6 +384,7 @@ namespace ClassGame {
             // Game-specific additional info for Chess
             Chess* chessGame = dynamic_cast<Chess*>(game);
             if (chessGame && !gameOver) {
+                chessGame->setSearchDepth(chessAIDepth);
                 ImGui::Separator();
                 
                 if (chessGame->getCurrentPlayer()) {

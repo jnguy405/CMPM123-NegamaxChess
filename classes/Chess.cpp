@@ -10,8 +10,13 @@
 #include <chrono>
 #include <thread>
 #include <climits>
+#include <cstring>
 
-// Piece values (adjusted for better play)
+// ============================================================================
+// ALPHA-BETA PRUNING PARAMETERS
+// ============================================================================
+
+// Piece values (adjusted for better play which prioritize material and king safety more heavily)
 const int PIECE_VALUES[6] = {
     100,   // Pawn
     320,   // Knight  
@@ -21,7 +26,7 @@ const int PIECE_VALUES[6] = {
     20000  // King
 };
 
-// Bonus for controlling center squares
+// Bonus for controlling center squares (control of center helps with overall piece activity and mobility)
 const int CENTER_BONUS[64] = {
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 1, 1, 1, 1, 1, 1, 0,
@@ -41,13 +46,71 @@ const int PASSED_PAWN_BONUS[8] = {
     0, 10, 20, 30, 50, 80, 150, 0
 };
 
-// Bonus for bishop pair
+// Bonus for bishop pair (helps with long-range control and piece coordination)
 const int BISHOP_PAIR_BONUS = 30;
 
-// Mobility bonus per move
+// Mobility bonus per move (encourages piece activity and control of the board)
 const int MOBILITY_BONUS = 2;
 
-// Move ordering - center squares first for better pruning
+// Move ordering bonuses (captures, killer moves, and history heuristic) prioritize bonuses then simple heuristics
+const int ORDER_CAPTURE_BASE = 100000;
+const int ORDER_KILLER_BASE = 80000;
+const int ORDER_HISTORY_SCALE = 4;
+
+// ============================================================================
+// Special-move helpers (used by both applyMoveToBitboards and applyMoveToState)
+// ============================================================================
+static inline void getCastlingRookFromTo(char moverColor, bool kingSide, int& rookFrom, int& rookTo) {
+    if (moverColor == 'w') {
+        if (kingSide) { rookFrom = 7; rookTo = 5; }    // h1 -> f1
+        else          { rookFrom = 0; rookTo = 3; }    // a1 -> d1
+    } else {
+        if (kingSide) { rookFrom = 63; rookTo = 61; }  // h8 -> f8
+        else          { rookFrom = 56; rookTo = 59; }  // a8 -> d8
+    }
+}
+
+static inline int enPassantCapturedSquare(char moverColor, const BitMove& move) {
+    // Captured pawn is behind the destination square.
+    return (moverColor == 'w') ? (static_cast<int>(move.to) - 8)
+                               : (static_cast<int>(move.to) + 8);
+}
+
+static inline char promotedCharFromFlag(char moverColor, ChessPiece promotionPiece) {
+    char base = (moverColor == 'w') ? 'Q' : 'q';
+    switch (promotionPiece) {
+        case Knight: return (moverColor == 'w') ? 'N' : 'n';
+        case Bishop: return (moverColor == 'w') ? 'B' : 'b';
+        case Rook:   return (moverColor == 'w') ? 'R' : 'r';
+        case Queen:  return base;
+        default:     return base;
+    }
+}
+
+// ============================================================================
+// Node snapshot helpers for save/restore code in search
+// ============================================================================
+Chess::NodeSearchState Chess::captureNodeSearchState() const {
+    return NodeSearchState{
+        _whitePawns, _whiteKnights, _whiteBishops, _whiteRooks, _whiteQueens, _whiteKing,
+        _blackPawns, _blackKnights, _blackBishops, _blackRooks, _blackQueens, _blackKing,
+        _whiteKingMoved, _blackKingMoved,
+        _whiteRookAFileMoved, _whiteRookHFileMoved,
+        _blackRookAFileMoved, _blackRookHFileMoved,
+        _enPassantSquare
+    };
+}
+
+void Chess::restoreNodeSearchState(const NodeSearchState& s) {
+    _whitePawns = s.wp; _whiteKnights = s.wn; _whiteBishops = s.wb; _whiteRooks = s.wr; _whiteQueens = s.wq; _whiteKing = s.wk;
+    _blackPawns = s.bp; _blackKnights = s.bn; _blackBishops = s.bb; _blackRooks = s.br; _blackQueens = s.bq; _blackKing = s.bk;
+    _whiteKingMoved = s.wkm; _blackKingMoved = s.bkm;
+    _whiteRookAFileMoved = s.wRA; _whiteRookHFileMoved = s.wRH;
+    _blackRookAFileMoved = s.bRA; _blackRookHFileMoved = s.bRH;
+    _enPassantSquare = s.ep;
+}
+
+// Move ordering - simple heuristic to try moves from the center outwards for better pruning
 static const int MOVE_ORDER[64] = {
     27, 28, 29, 30, 31, 32, 33, 34,
     20, 21, 22, 23, 24, 25, 26, 35,
@@ -58,6 +121,10 @@ static const int MOVE_ORDER[64] = {
     48, 49, 50, 51, 52, 53, 54, 55,
     56, 57, 58, 59, 60, 61, 62, 63
 };
+
+// ============================================================================
+// CONSTRUCTION & INITIALIZATION
+// ============================================================================
 
 // Attack function wrappers for consistent interface
 static uint64_t knightAttacks(int sq, uint64_t) { return KnightAttacks[sq]; }
@@ -71,16 +138,19 @@ static struct MagicInit {
     ~MagicInit() { cleanupMagicBitboards(); }
 } magicInit;
 
-// ============================================================================
-// CONSTRUCTION & INITIALIZATION
-// ============================================================================
-
 Chess::Chess()
     : _whitePawns(0), _whiteKnights(0), _whiteBishops(0), _whiteRooks(0), _whiteQueens(0), _whiteKing(0),
-      _blackPawns(0), _blackKnights(0), _blackBishops(0), _blackRooks(0), _blackQueens(0), _blackKing(0)
+      _blackPawns(0), _blackKnights(0), _blackBishops(0), _blackRooks(0), _blackQueens(0), _blackKing(0),
+      _searchDepth(3), _whiteKingMoved(false), _blackKingMoved(false),
+      _whiteRookAFileMoved(false), _whiteRookHFileMoved(false),
+      _blackRookAFileMoved(false), _blackRookHFileMoved(false),
+      _enPassantSquare(-1)
 {
     _grid = new Grid(8, 8);
     _bestMove = BitMove();
+    std::memset(_killerFrom, -1, sizeof(_killerFrom));
+    std::memset(_killerTo, -1, sizeof(_killerTo));
+    std::memset(_historyHeuristic, 0, sizeof(_historyHeuristic));
 }
 
 Chess::~Chess()
@@ -88,6 +158,7 @@ Chess::~Chess()
     delete _grid;
 }
 
+// Set up the chess board with pieces in their initial positions and reset game state variables
 void Chess::setUpBoard()
 {
     setNumberOfPlayers(2);
@@ -95,9 +166,14 @@ void Chess::setUpBoard()
     _gameOptions.rowY = 8;
     _grid->initializeChessSquares(pieceSize, "boardsquare.png");
     FENtoBoard("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR");
+    _whiteKingMoved = _blackKingMoved = false;
+    _whiteRookAFileMoved = _whiteRookHFileMoved = false;
+    _blackRookAFileMoved = _blackRookHFileMoved = false;
+    _enPassantSquare = -1;
     startGame();
 }
 
+// Clean up the board and reset all game state variables to prepare for a new game or exit
 void Chess::stopGame() {
     _grid->forEachSquare([](ChessSquare* square, int x, int y) {
         square->destroyBit();
@@ -105,8 +181,16 @@ void Chess::stopGame() {
     
     _whitePawns = _whiteKnights = _whiteBishops = _whiteRooks = _whiteQueens = _whiteKing = 0;
     _blackPawns = _blackKnights = _blackBishops = _blackRooks = _blackQueens = _blackKing = 0;
+    _enPassantSquare = -1;
 }
 
+// Set the search depth for the AI (with limits to prevent excessive computation time)
+void Chess::setSearchDepth(int depth) {
+    _searchDepth = std::max(1, std::min(depth, 8));
+}
+
+
+// Convert a FEN string to the internal board representation, setting up the pieces and bitboards accordingly
 void Chess::FENtoBoard(const std::string& fen) {
     std::istringstream iss(fen);
     std::string boardPosition;
@@ -159,6 +243,7 @@ void Chess::FENtoBoard(const std::string& fen) {
 // PLAYER & TURN MANAGEMENT
 // ============================================================================
 
+// Check if a move can be made from the source square based on the piece's ownership and current player's turn
 bool Chess::canBitMoveFrom(Bit &bit, BitHolder &src)
 {
     int currentPlayerNum = getCurrentPlayer()->playerNumber();
@@ -166,6 +251,7 @@ bool Chess::canBitMoveFrom(Bit &bit, BitHolder &src)
     return (pieceColor == currentPlayerNum);
 }
 
+// Check if a move can be made from the source square to the destination square based on piece movement rules and current board state
 bool Chess::canBitMoveFromTo(Bit &bit, BitHolder &src, BitHolder &dst)
 {
     ChessSquare* srcSquare = dynamic_cast<ChessSquare*>(&src);
@@ -192,19 +278,79 @@ bool Chess::actionForEmptyHolder(BitHolder &holder)
     return false;
 }
 
+// Apply a move to the board, updating both the grid and the bitboards accordingly, and then end the turn   
 void Chess::applyMoveToBitboards(const BitMove& move, int playerNumber) {
     ChessPiece pieceType = static_cast<ChessPiece>(move.piece);
     int enemyPlayer = (playerNumber == 0) ? 1 : 0;
-    
+    uint64_t toMask = (1ULL << move.to);
+
+    // CAPTURES (normal and en passant)
+    // Normal captures remove the piece on the destination square
+    // En passant captures remove the pawn on the square behind the destination square
+    if (move.flags & BitMove::MoveEnPassant) {
+        char moverColor = (playerNumber == 0) ? 'w' : 'b';
+        int capturedSquare = enPassantCapturedSquare(moverColor, move);
+        if (capturedSquare >= 0 && capturedSquare < 64) {
+            if (playerNumber == 0) CLEAR_BIT(_blackPawns, capturedSquare);
+            else CLEAR_BIT(_whitePawns, capturedSquare);
+        }
+    } else {
+        static const ChessPiece types[6] = {Pawn, Knight, Bishop, Rook, Queen, King};
+        for (int i = 0; i < 6; i++) {
+            CLEAR_BIT(getBitboard(types[i], enemyPlayer), move.to);
+        }
+    }
+
+    // PROMOTIONS (handled by setting the destination bit to the promoted piece type instead of the original piece type)
+    // If it's a promotion move, we set the destination bit to the promoted piece type. Otherwise, we just move the original piece type.
     CLEAR_BIT(getBitboard(pieceType, playerNumber), move.from);
-    SET_BIT(getBitboard(pieceType, playerNumber), move.to);
-    
-    static const ChessPiece types[6] = {Pawn, Knight, Bishop, Rook, Queen, King};
-    for (int i = 0; i < 6; i++) {
-        CLEAR_BIT(getBitboard(types[i], enemyPlayer), move.to);
+    if ((move.flags & BitMove::MovePromotion) && move.promotion != NoPiece) {
+        SET_BIT(getBitboard(static_cast<ChessPiece>(move.promotion), playerNumber), move.to);
+    } else {
+        SET_BIT(getBitboard(pieceType, playerNumber), move.to);
+    }
+
+    // CASTLING (handled by moving the rook in addition to the king when a castling move is made)
+    if (move.flags & BitMove::MoveCastleKingSide) {
+        char moverColor = (playerNumber == 0) ? 'w' : 'b';
+        int rookFrom, rookTo;
+        getCastlingRookFromTo(moverColor, true, rookFrom, rookTo);
+        CLEAR_BIT(getBitboard(Rook, playerNumber), rookFrom);
+        SET_BIT(getBitboard(Rook, playerNumber), rookTo);
+    } else if (move.flags & BitMove::MoveCastleQueenSide) {
+        char moverColor = (playerNumber == 0) ? 'w' : 'b';
+        int rookFrom, rookTo;
+        getCastlingRookFromTo(moverColor, false, rookFrom, rookTo);
+        CLEAR_BIT(getBitboard(Rook, playerNumber), rookFrom);
+        SET_BIT(getBitboard(Rook, playerNumber), rookTo);
+    }
+
+    // Update castling rights and en-passant square
+    if (pieceType == King) {
+        if (playerNumber == 0) _whiteKingMoved = true;
+        else _blackKingMoved = true;
+    }
+    if (pieceType == Rook) {
+        if (playerNumber == 0) {
+            if (move.from == 0) _whiteRookAFileMoved = true;
+            if (move.from == 7) _whiteRookHFileMoved = true;
+        } else {
+            if (move.from == 56) _blackRookAFileMoved = true;
+            if (move.from == 63) _blackRookHFileMoved = true;
+        }
+    }
+    if (toMask & (1ULL << 0)) _whiteRookAFileMoved = true;
+    if (toMask & (1ULL << 7)) _whiteRookHFileMoved = true;
+    if (toMask & (1ULL << 56)) _blackRookAFileMoved = true;
+    if (toMask & (1ULL << 63)) _blackRookHFileMoved = true;
+
+    _enPassantSquare = -1;
+    if (pieceType == Pawn && std::abs((int)move.to - (int)move.from) == 16) {
+        _enPassantSquare = (move.from + move.to) / 2;
     }
 }
 
+// Apply a move to the board, update grid and bitboards, and then end the turn
 void Chess::makeMove(const BitMove& move) {
     updateBitboardsFromGrid();
     
@@ -215,6 +361,7 @@ void Chess::makeMove(const BitMove& move) {
     endTurn();
 }
 
+// Update the board state after a move is completed,grid and bitboards are synchronized, and then end the turn
 void Chess::moveCompleted(Bit* bit, BitHolder* src, BitHolder* dst)
 {
     if (!bit || !src || !dst) return;
@@ -245,6 +392,9 @@ void Chess::undoMove(const BitMove& move, Bit* capturedPiece) {
     endTurn();
 }
 
+
+// Check for a winner by verifying if either king has been captured (i.e., if the corresponding bitboard is empty)
+// Return the winning player
 Player* Chess::checkForWinner() {
     updateBitboardsFromGrid();
     if (_whiteKing == 0) return getPlayerAt(1);
@@ -252,10 +402,14 @@ Player* Chess::checkForWinner() {
     return nullptr;
 }
 
+// Check for a draw by verifying if the current player has any legal moves available
+// returns true if not (indicating stalemate or checkmate)
 bool Chess::checkForDraw() {
     return generateAllMoves().empty();
 }
 
+// Grabs the piece sprite based on the player number and piece type
+// returns a new Bit with the correct texture and game tag for ownership and type identification
 Bit* Chess::PieceForPlayer(const int playerNumber, ChessPiece piece)
 {
     const char* pieces[] = { "pawn.png", "knight.png", "bishop.png", "rook.png", "queen.png", "king.png" };
@@ -269,6 +423,8 @@ Bit* Chess::PieceForPlayer(const int playerNumber, ChessPiece piece)
     return bit;
 }
 
+// Get the owner of the piece at the specified coordinates
+// Returns a pointer to the Player who owns the piece, or nullptr if the square is empty or out of bounds
 Player* Chess::ownerAt(int x, int y) const
 {
     if (x < 0 || x >= 8 || y < 0 || y >= 8) return nullptr;
@@ -315,6 +471,9 @@ char Chess::pieceNotation(int x, int y) const {
 // BITBOARD HELPERS
 // ============================================================================
 
+// Take the current grid state and update all bitboards to match the pieces on the board
+// Used for: synchronizing the internal bitboard representation with the visual board state after moves are made or undone
+//           and for initializing the bitboards from a FEN string
 void Chess::updateBitboardsFromGrid() {
     _whitePawns = _whiteKnights = _whiteBishops = _whiteRooks = _whiteQueens = _whiteKing = 0;
     _blackPawns = _blackKnights = _blackBishops = _blackRooks = _blackQueens = _blackKing = 0;
@@ -333,6 +492,8 @@ void Chess::updateBitboardsFromGrid() {
     }
 }
 
+// Take the current bitboard states and update the grid to match the pieces represented by the bitboards
+// Used for: synchronizing the visual board state with the internal bitboard representation after moves are made or undone
 void Chess::updateGridFromBitboards() {
     for (int row = 0; row < 8; row++)
         for (int col = 0; col < 8; col++)
@@ -357,6 +518,8 @@ void Chess::updateGridFromBitboards() {
             placePieces(getBitboard(types[i], player), player, types[i]);
 }
 
+// Get a reference to the bitboard for the specified piece type and player number (0 for white, 1 for black)
+// Used for: quick access and modification of the bitboards based on piece type and ownership
 uint64_t& Chess::getBitboard(ChessPiece pieceType, int playerNumber) {
     if (playerNumber == 0) {
         switch (pieceType) {
@@ -397,13 +560,22 @@ uint64_t Chess::getAllPieces() const {
 // MOVE GENERATION
 // ============================================================================
 
+// Creates a list of all possible moves for the current player based on the current board state
 void Chess::addPawnBitboardMovesToList(std::vector<BitMove>& moves, uint64_t bitboard, int shift) {
     BitboardElement(bitboard).forEachBit([&](int toSquare) {
         int fromSquare = toSquare - shift;
-        moves.emplace_back(fromSquare, toSquare, Pawn);
+        bool isPromotion = (toSquare / 8 == 0 || toSquare / 8 == 7);
+        if (isPromotion) {
+            moves.emplace_back(fromSquare, toSquare, Pawn, Queen, BitMove::MovePromotion);
+        } else {
+            moves.emplace_back(fromSquare, toSquare, Pawn);
+        }
     });
 }
 
+
+// Generate all possible moves for PAWNS, including single and double moves, captures, en-passant, and promotions
+// Based on the current board state and the player's color
 void Chess::generatePawnMoves(std::vector<BitMove>& moves, char color) {
     uint64_t pawns = (color == 'w') ? _whitePawns : _blackPawns;
     if (pawns == 0) return;
@@ -429,8 +601,30 @@ void Chess::generatePawnMoves(std::vector<BitMove>& moves, char color) {
     addPawnBitboardMovesToList(moves, doubleMoves,   shiftDouble);
     addPawnBitboardMovesToList(moves, capturesLeft,  shiftCaptureLeft);
     addPawnBitboardMovesToList(moves, capturesRight, shiftCaptureRight);
+
+    // Add en-passant captures if the target square is currently available.
+    if (_enPassantSquare >= 0 && _enPassantSquare < 64) {
+        uint64_t epMask = (1ULL << _enPassantSquare);
+        if (color == 'w') {
+            uint64_t fromLeft = SOUTH_EAST(epMask) & pawns;
+            uint64_t fromRight = SOUTH_WEST(epMask) & pawns;
+            BitboardElement(fromLeft | fromRight).forEachBit([&](int fromSquare) {
+                moves.emplace_back(fromSquare, _enPassantSquare, Pawn, NoPiece,
+                                   BitMove::MoveEnPassant | BitMove::MoveCapture);
+            });
+        } else {
+            uint64_t fromLeft = NORTH_EAST(epMask) & pawns;
+            uint64_t fromRight = NORTH_WEST(epMask) & pawns;
+            BitboardElement(fromLeft | fromRight).forEachBit([&](int fromSquare) {
+                moves.emplace_back(fromSquare, _enPassantSquare, Pawn, NoPiece,
+                                   BitMove::MoveEnPassant | BitMove::MoveCapture);
+            });
+        }
+    }
 }
 
+// Generate moves for knights, bishops, rooks, and queens by using the appropriate attack functions 
+// to find valid destination squares based on the current board state and piece positions
 void Chess::generatePieceMoves(std::vector<BitMove>& moves, char color,
                                 ChessPiece pieceType, uint64_t(*attackFn)(int, uint64_t)) {
     uint64_t pieces   = getBitboard(pieceType, color == 'w' ? 0 : 1);
@@ -444,27 +638,60 @@ void Chess::generatePieceMoves(std::vector<BitMove>& moves, char color,
         uint64_t attacks = attackFn(fromSquare, occupied) & ~friendly;
         BitboardElement attackBB(attacks);
         attackBB.forEachBit([&](int toSquare) {
-            moves.emplace_back(fromSquare, toSquare, pieceType);
+            uint8_t flags = (GET_BIT((color == 'w') ? getBlackPieces() : getWhitePieces(), toSquare) != 0)
+                                ? BitMove::MoveCapture
+                                : BitMove::MoveNone;
+            moves.emplace_back(fromSquare, toSquare, pieceType, NoPiece, flags);
         });
     });
 }
 
+// Generate castling moves for the king if the appropriate conditions are met (king and rook haven't moved, path is clear, and squares aren't attacked)
+void Chess::generateCastlingMoves(std::vector<BitMove>& moves, char color) {
+    // Verify castling rights and empty path squares.
+    if (color == 'w') {
+        if (!_whiteKingMoved && !isKingInCheck('w')) {
+            bool canKingSide = !_whiteRookHFileMoved &&
+                               !GET_BIT(getAllPieces(), 5) &&
+                               !GET_BIT(getAllPieces(), 6) &&
+                               !isSquareAttacked(5, 'b') &&
+                               !isSquareAttacked(6, 'b');
+            if (canKingSide) moves.emplace_back(4, 6, King, NoPiece, BitMove::MoveCastleKingSide);
+
+            bool canQueenSide = !_whiteRookAFileMoved &&
+                                !GET_BIT(getAllPieces(), 1) &&
+                                !GET_BIT(getAllPieces(), 2) &&
+                                !GET_BIT(getAllPieces(), 3) &&
+                                !isSquareAttacked(3, 'b') &&
+                                !isSquareAttacked(2, 'b');
+            if (canQueenSide) moves.emplace_back(4, 2, King, NoPiece, BitMove::MoveCastleQueenSide);
+        }
+    } else {
+        if (!_blackKingMoved && !isKingInCheck('b')) {
+            bool canKingSide = !_blackRookHFileMoved &&
+                               !GET_BIT(getAllPieces(), 61) &&
+                               !GET_BIT(getAllPieces(), 62) &&
+                               !isSquareAttacked(61, 'w') &&
+                               !isSquareAttacked(62, 'w');
+            if (canKingSide) moves.emplace_back(60, 62, King, NoPiece, BitMove::MoveCastleKingSide);
+
+            bool canQueenSide = !_blackRookAFileMoved &&
+                                !GET_BIT(getAllPieces(), 57) &&
+                                !GET_BIT(getAllPieces(), 58) &&
+                                !GET_BIT(getAllPieces(), 59) &&
+                                !isSquareAttacked(59, 'w') &&
+                                !isSquareAttacked(58, 'w');
+            if (canQueenSide) moves.emplace_back(60, 58, King, NoPiece, BitMove::MoveCastleQueenSide);
+        }
+    }
+}
+
 std::vector<BitMove> Chess::generateAllMoves() {
-    std::vector<BitMove> moves;
-    moves.reserve(40);
-
-    updateBitboardsFromGrid();
-
+    // Use current visible board as source state.
+    std::string state = stateString();
     char color = (getCurrentPlayer()->playerNumber() == 0) ? 'w' : 'b';
-
-    generatePawnMoves(moves, color);
-    generatePieceMoves(moves, color, Knight, knightAttacks);
-    generatePieceMoves(moves, color, Bishop, bishopAttacks);
-    generatePieceMoves(moves, color, Rook, rookAttacks);
-    generatePieceMoves(moves, color, Queen, queenAttacks);
-    generatePieceMoves(moves, color, King, kingAttacks);
-
-    return moves;
+    // Return legal moves only for gameplay and UI validation.
+    return generateAllMovesFromState(state, color, true);
 }
 
 // ============================================================================
@@ -513,7 +740,147 @@ void Chess::stateStringToBitboards(const std::string& state)
     }
 }
 
-std::vector<BitMove> Chess::generateAllMovesFromState(const std::string& state, char currentColor)
+// Check if a given square is attacked by any pieces of the specified color
+bool Chess::isSquareAttacked(int square, char byColor) const {
+    uint64_t occupied = getAllPieces();
+    uint64_t targetMask = (1ULL << square);
+    uint64_t enemyPawns = (byColor == 'w') ? _whitePawns : _blackPawns;
+    uint64_t enemyKnights = (byColor == 'w') ? _whiteKnights : _blackKnights;
+    uint64_t enemyBishops = (byColor == 'w') ? _whiteBishops : _blackBishops;
+    uint64_t enemyRooks = (byColor == 'w') ? _whiteRooks : _blackRooks;
+    uint64_t enemyQueens = (byColor == 'w') ? _whiteQueens : _blackQueens;
+    uint64_t enemyKing = (byColor == 'w') ? _whiteKing : _blackKing;
+
+    // Pawn attacks are directional by attacker color.
+    uint64_t pawnAttackers = (byColor == 'w')
+                                 ? (SOUTH_EAST(targetMask) | SOUTH_WEST(targetMask))
+                                 : (NORTH_EAST(targetMask) | NORTH_WEST(targetMask));
+    if (pawnAttackers & enemyPawns) return true;
+    if (KnightAttacks[square] & enemyKnights) return true;
+    if (KingAttacks[square] & enemyKing) return true;
+    if (getBishopAttacks(square, occupied) & (enemyBishops | enemyQueens)) return true;
+    if (getRookAttacks(square, occupied) & (enemyRooks | enemyQueens)) return true;
+
+    return false;
+}
+
+// Check if the king of the specified color is currently in check by verifying if its square is attacked by any enemy pieces
+bool Chess::isKingInCheck(char color) const {
+    uint64_t kingBB = (color == 'w') ? _whiteKing : _blackKing;
+    if (!kingBB) return true;
+    int kingSq = bitScanForward(kingBB);
+    return isSquareAttacked(kingSq, color == 'w' ? 'b' : 'w');
+}
+
+// Apply a move to a given board state string and return the resulting new state string, handling all special move types (en-passant, castling, promotions)
+std::string Chess::applyMoveToState(const std::string& state, const BitMove& move, char moverColor) const {
+    std::string newState = state;
+    if (move.from >= newState.length() || move.to >= newState.length()) return newState;
+
+    char movingPiece = newState[move.from];
+    newState[move.from] = '0';
+
+    // Handle en-passant captured pawn removal.
+    if (move.flags & BitMove::MoveEnPassant) {
+        int capturedSquare = enPassantCapturedSquare(moverColor, move);
+        if (capturedSquare >= 0 && capturedSquare < 64) {
+            newState[capturedSquare] = '0';
+        }
+    }
+
+    // Handle castling rook motion.
+    if (move.flags & BitMove::MoveCastleKingSide) {
+        int rookFrom, rookTo;
+        getCastlingRookFromTo(moverColor, true, rookFrom, rookTo);
+        newState[rookTo] = newState[rookFrom];
+        newState[rookFrom] = '0';
+    } else if (move.flags & BitMove::MoveCastleQueenSide) {
+        int rookFrom, rookTo;
+        getCastlingRookFromTo(moverColor, false, rookFrom, rookTo);
+        newState[rookTo] = newState[rookFrom];
+        newState[rookFrom] = '0';
+    }
+
+    // Handle promotions (currently auto-queen when promotion flag is set).
+    if ((move.flags & BitMove::MovePromotion) && move.promotion != NoPiece) {
+        newState[move.to] = promotedCharFromFlag(moverColor, static_cast<ChessPiece>(move.promotion));
+    } else {
+        newState[move.to] = movingPiece;
+    }
+
+    return newState;
+}
+
+std::vector<BitMove> Chess::generateAllMovesFromBitboards(const std::string& state, char currentColor, bool legalOnly,
+                                                            bool restoreNodeBitboards)
+{
+
+    // Optionally save node bitboards so the caller sees no side effects.
+    uint64_t savedWhitePawns = 0, savedWhiteKnights = 0, savedWhiteBishops = 0, savedWhiteRooks = 0, savedWhiteQueens = 0, savedWhiteKing = 0;
+    uint64_t savedBlackPawns = 0, savedBlackKnights = 0, savedBlackBishops = 0, savedBlackRooks = 0, savedBlackQueens = 0, savedBlackKing = 0;
+    if (restoreNodeBitboards) {
+        savedWhitePawns = _whitePawns;
+        savedWhiteKnights = _whiteKnights;
+        savedWhiteBishops = _whiteBishops;
+        savedWhiteRooks = _whiteRooks;
+        savedWhiteQueens = _whiteQueens;
+        savedWhiteKing = _whiteKing;
+        savedBlackPawns = _blackPawns;
+        savedBlackKnights = _blackKnights;
+        savedBlackBishops = _blackBishops;
+        savedBlackRooks = _blackRooks;
+        savedBlackQueens = _blackQueens;
+        savedBlackKing = _blackKing;
+    }
+
+    // Generate moves
+    std::vector<BitMove> pseudoMoves;
+    pseudoMoves.reserve(48);
+    
+    // Generate pseudo-legal moves from bitboards (including moves that may leave king in check)
+    generatePawnMoves(pseudoMoves, currentColor);
+    generatePieceMoves(pseudoMoves, currentColor, Knight, knightAttacks);
+    generatePieceMoves(pseudoMoves, currentColor, Bishop, bishopAttacks);
+    generatePieceMoves(pseudoMoves, currentColor, Rook, rookAttacks);
+    generatePieceMoves(pseudoMoves, currentColor, Queen, queenAttacks);
+    generatePieceMoves(pseudoMoves, currentColor, King, kingAttacks);
+    generateCastlingMoves(pseudoMoves, currentColor);
+
+    std::vector<BitMove> moves;
+    if (!legalOnly) {
+        moves = pseudoMoves;
+    } else {
+        // Keep only legal moves (king cannot remain in check after move).
+        moves.reserve(pseudoMoves.size());
+        for (const auto& move : pseudoMoves) {
+            std::string nextState = applyMoveToState(state, move, currentColor);
+            stateStringToBitboards(nextState);
+            if (!isKingInCheck(currentColor)) {
+                moves.push_back(move);
+            }
+        }
+    }
+
+    // Restore node bitboards (critical for correctness when called directly).
+    if (restoreNodeBitboards) {
+        _whitePawns = savedWhitePawns;
+        _whiteKnights = savedWhiteKnights;
+        _whiteBishops = savedWhiteBishops;
+        _whiteRooks = savedWhiteRooks;
+        _whiteQueens = savedWhiteQueens;
+        _whiteKing = savedWhiteKing;
+        _blackPawns = savedBlackPawns;
+        _blackKnights = savedBlackKnights;
+        _blackBishops = savedBlackBishops;
+        _blackRooks = savedBlackRooks;
+        _blackQueens = savedBlackQueens;
+        _blackKing = savedBlackKing;
+    }
+
+    return moves;
+}
+
+std::vector<BitMove> Chess::generateAllMovesFromState(const std::string& state, char currentColor, bool legalOnly)
 {
     // Save current bitboards
     uint64_t savedWhitePawns = _whitePawns;
@@ -528,21 +895,13 @@ std::vector<BitMove> Chess::generateAllMovesFromState(const std::string& state, 
     uint64_t savedBlackRooks = _blackRooks;
     uint64_t savedBlackQueens = _blackQueens;
     uint64_t savedBlackKing = _blackKing;
-    
+
     // Set up from state string
     stateStringToBitboards(state);
-    
-    // Generate moves
-    std::vector<BitMove> moves;
-    moves.reserve(40);
-    
-    generatePawnMoves(moves, currentColor);
-    generatePieceMoves(moves, currentColor, Knight, knightAttacks);
-    generatePieceMoves(moves, currentColor, Bishop, bishopAttacks);
-    generatePieceMoves(moves, currentColor, Rook, rookAttacks);
-    generatePieceMoves(moves, currentColor, Queen, queenAttacks);
-    generatePieceMoves(moves, currentColor, King, kingAttacks);
-    
+    // Wrapper already restores the caller's bitboards, so we can skip the inner
+    // restore to avoid redundant save/restore work.
+    std::vector<BitMove> moves = generateAllMovesFromBitboards(state, currentColor, legalOnly, false);
+
     // Restore saved bitboards
     _whitePawns = savedWhitePawns;
     _whiteKnights = savedWhiteKnights;
@@ -556,7 +915,7 @@ std::vector<BitMove> Chess::generateAllMovesFromState(const std::string& state, 
     _blackRooks = savedBlackRooks;
     _blackQueens = savedBlackQueens;
     _blackKing = savedBlackKing;
-    
+
     return moves;
 }
 
@@ -587,10 +946,8 @@ int Chess::getPieceSquareValue(char pieceChar, int square) const {
     }
 }
 
-bool Chess::aiTestForTerminalState(std::string &state, Player *&winner)
+bool Chess::aiTestForTerminalState(std::string &state, char currentColor, Player *&winner)
 {
-    stateStringToBitboards(state);
-    
     if (_whiteKing == 0) {
         winner = getPlayerAt(1);
         return true;
@@ -601,18 +958,13 @@ bool Chess::aiTestForTerminalState(std::string &state, Player *&winner)
         return true;
     }
     
-    // Check for stalemate (no legal moves)
-    char currentColor = 'w';
-    for (size_t i = 0; i < state.length(); i++) {
-        if (state[i] != '0') {
-            currentColor = isupper(state[i]) ? 'w' : 'b';
-            break;
-        }
-    }
-    
-    std::vector<BitMove> moves = generateAllMovesFromState(state, currentColor);
+    // Check for no legal moves for the side to move in this node.
+    std::vector<BitMove> moves = generateAllMovesFromBitboards(state, currentColor, true);
     if (moves.empty()) {
-        winner = nullptr; // Stalemate is a draw
+        // No legal moves: checkmate if in check, otherwise stalemate.
+        winner = isKingInCheck(currentColor)
+                     ? getPlayerAt(currentColor == 'w' ? 1 : 0)
+                     : nullptr;
         return true;
     }
     
@@ -672,6 +1024,7 @@ int Chess::evaluatePawnStructure(char color) {
         pawnCountByFile[file]++;
         
         // Check for passed pawns (no enemy pawns ahead on same or adjacent files)
+        // Based on the rank of the pawn, check the appropriate ranks ahead for enemy pawns on the same and adjacent files.
         if (color == 'w') {
             bool isPassed = true;
             for (int f = std::max(0, file - 1); f <= std::min(7, file + 1); f++) {
@@ -699,7 +1052,7 @@ int Chess::evaluatePawnStructure(char color) {
         }
     });
     
-    // Penalty for doubled pawns
+    // Penalty for doubled pawns (2 or more pawns on the same file)
     for (int file = 0; file < 8; file++) {
         if (pawnCountByFile[file] > 1) {
             score += DOUBLED_PAWN_PENALTY * (pawnCountByFile[file] - 1);
@@ -769,42 +1122,89 @@ int Chess::evaluateBoard(const std::string &state)
     return score;
 }
 
+// Takes the current board state, a move, and the current ply from the root of the search, and 
+// returns a score for how promising this move is for move ordering purposes in the search algorithm. 
+// Higher scores indicate more promising moves that should be searched first.
+int Chess::scoreMoveForOrdering(const std::string& state, const BitMove& move, int plyFromRoot) const {
+    int score = 0;
+    char moving = (move.from < state.length()) ? state[move.from] : '0';
+    char target = (move.to < state.length()) ? state[move.to] : '0';
+
+    // Captures are scored highest, with MVV-LVA (Most Valuable Victim - Least Valuable Attacker) ordering.
+    if ((move.flags & BitMove::MoveCapture) || target != '0' || (move.flags & BitMove::MoveEnPassant)) {    // Capture move
+        int victimValue = (move.flags & BitMove::MoveEnPassant) ? PIECE_VALUES[0] : getPieceValue(target);  // En-passant captures are treated as capturing a pawn for ordering purposes.
+        int attackerValue = getPieceValue(moving);                                                          // MVV-LVA: prioritize captures of more valuable pieces and less valuable attackers.
+        score += ORDER_CAPTURE_BASE + (victimValue * 10 - attackerValue);                                   // Bonus for capturing more valuable pieces with less valuable ones.
+    } else {
+        // Non-capture moves are scored based on killer move heuristics and history heuristic.
+        int ply = std::max(0, std::min(plyFromRoot, 15));
+        if (_killerFrom[ply][0] == move.from && _killerTo[ply][0] == move.to) score += ORDER_KILLER_BASE;               // Primary killer move for this ply
+        else if (_killerFrom[ply][1] == move.from && _killerTo[ply][1] == move.to) score += ORDER_KILLER_BASE - 1000;   // Secondary killer move for this ply
+        score += _historyHeuristic[move.from][move.to] * ORDER_HISTORY_SCALE;                                           // Bonus for moves that have historically caused beta cutoffs, scaled by how deep in the search they occur.
+    }
+
+    int toRank = move.to / 8;                           // Uses simple heuristic to prioritize moves that control the center of the board
+    int toFile = move.to % 8;                           
+    int centerDist = abs(3 - toRank) + abs(3 - toFile);
+    score += (14 - centerDist);                         // Adds score based on proximity to center
+    return score;
+}
+
 int Chess::negamax(std::string &state, int depth, int alpha, int beta, 
-                   char currentColor)
+                   char currentColor, bool wkm, bool bkm, bool wrA, bool wrH, bool brA, bool brH,
+                   int epSquare, int plyFromRoot)
 {
+    // Save search-state metadata and install state for this node (a node is a move).
+    bool savedWKM = _whiteKingMoved, savedBKM = _blackKingMoved;
+    bool savedWRA = _whiteRookAFileMoved, savedWRH = _whiteRookHFileMoved;
+    bool savedBRA = _blackRookAFileMoved, savedBRH = _blackRookHFileMoved;
+    int savedEP = _enPassantSquare;
+    _whiteKingMoved = wkm; _blackKingMoved = bkm;
+    _whiteRookAFileMoved = wrA; _whiteRookHFileMoved = wrH;
+    _blackRookAFileMoved = brA; _blackRookHFileMoved = brH;
+    _enPassantSquare = epSquare;
+    stateStringToBitboards(state); // Bitboards are authoritative for this search node
+
     Player* winner = nullptr;
-    bool isTerminal = aiTestForTerminalState(state, winner);
+    bool isTerminal = aiTestForTerminalState(state, currentColor, winner);
     
+    // Test for terminal state (checkmate or stalemate) or depth limit reached, and return appropriate score.
     if (isTerminal || depth == 0) {
         if (isTerminal) {
-            if (!winner) return 0; // Draw
+            if (!winner) {
+                _whiteKingMoved = savedWKM; _blackKingMoved = savedBKM;
+                _whiteRookAFileMoved = savedWRA; _whiteRookHFileMoved = savedWRH;
+                _blackRookAFileMoved = savedBRA; _blackRookHFileMoved = savedBRH;
+                _enPassantSquare = savedEP;
+                return 0; // Draw
+            }
             // Check if current player is winning/losing
             bool currentPlayerWins = (winner->playerNumber() == (currentColor == 'w' ? 0 : 1));
-            return currentPlayerWins ? 20000 : -20000;
+            int terminalScore = currentPlayerWins ? 20000 : -20000;
+            _whiteKingMoved = savedWKM; _blackKingMoved = savedBKM;
+            _whiteRookAFileMoved = savedWRA; _whiteRookHFileMoved = savedWRH;
+            _blackRookAFileMoved = savedBRA; _blackRookHFileMoved = savedBRH;
+            _enPassantSquare = savedEP;
+            return terminalScore;
         }
-        return evaluateBoard(state);
+        int eval = evaluateBoard(state);
+        eval = (currentColor == 'w') ? eval : -eval;
+        _whiteKingMoved = savedWKM; _blackKingMoved = savedBKM;
+        _whiteRookAFileMoved = savedWRA; _whiteRookHFileMoved = savedWRH;
+        _blackRookAFileMoved = savedBRA; _blackRookHFileMoved = savedBRH;
+        _enPassantSquare = savedEP;
+        return eval;
     }
     
     char nextColor = (currentColor == 'w') ? 'b' : 'w';
     int maxScore = INT_MIN;
     
-    std::vector<BitMove> moves = generateAllMovesFromState(state, currentColor);
+    std::vector<BitMove> moves = generateAllMovesFromBitboards(state, currentColor, true);
     
     // Move ordering - try captures first
     std::vector<std::pair<BitMove, int>> moveScores;
     for (const auto& move : moves) {
-        int moveScore = 0;
-        if (move.to < state.length() && move.from < state.length()) {
-            char targetPiece = state[move.to];
-            if (targetPiece != '0') {
-                moveScore = getPieceValue(targetPiece) * 10;
-            }
-            // Prioritize center control
-            int toRank = move.to / 8;
-            int toFile = move.to % 8;
-            int centerDist = abs(3 - toRank) + abs(3 - toFile);
-            moveScore += (14 - centerDist);
-        }
+        int moveScore = scoreMoveForOrdering(state, move, plyFromRoot);
         moveScores.push_back({move, moveScore});
     }
     
@@ -816,12 +1216,24 @@ int Chess::negamax(std::string &state, int depth, int alpha, int beta,
         
         if (move.to >= state.length() || move.from >= state.length()) continue;
         
-        // Make move
-        std::string newState = state;
-        newState[move.to] = newState[move.from];
-        newState[move.from] = '0';
+        // Apply move and recurse with updated state metadata.
+        std::string newState = applyMoveToState(state, move, currentColor);
+        int mover = (currentColor == 'w') ? 0 : 1;
+        // Snapshot node state so each candidate move starts from identical state.
+        NodeSearchState beforeMove = captureNodeSearchState();
+
+        // Apply the move to bitboards to update the node state for the recursive call.
+        applyMoveToBitboards(move, mover);
+        bool nextWKM = _whiteKingMoved, nextBKM = _blackKingMoved;
+        bool nextWRA = _whiteRookAFileMoved, nextWRH = _whiteRookHFileMoved;
+        bool nextBRA = _blackRookAFileMoved, nextBRH = _blackRookHFileMoved;
+        int nextEP = _enPassantSquare;
+
+        int score = -negamax(newState, depth - 1, -beta, -alpha, nextColor,
+                             nextWKM, nextBKM, nextWRA, nextWRH, nextBRA, nextBRH, nextEP, plyFromRoot + 1);
         
-        int score = -negamax(newState, depth - 1, -beta, -alpha, nextColor);
+        // Restore node metadata/bitboards for the next candidate move.
+        restoreNodeSearchState(beforeMove);
         
         if (score > maxScore) {
             maxScore = score;
@@ -829,11 +1241,24 @@ int Chess::negamax(std::string &state, int depth, int alpha, int beta,
         
         alpha = std::max(alpha, score);
         if (alpha >= beta) {
+            if (!((move.flags & BitMove::MoveCapture) || (move.flags & BitMove::MoveEnPassant))) {
+                int ply = std::max(0, std::min(plyFromRoot, 15));
+                _killerFrom[ply][1] = _killerFrom[ply][0];
+                _killerTo[ply][1] = _killerTo[ply][0];
+                _killerFrom[ply][0] = move.from;
+                _killerTo[ply][0] = move.to;
+                _historyHeuristic[move.from][move.to] += depth * depth;
+            }
             break; // Beta cutoff
         }
     }
-    
-    return (maxScore == INT_MIN) ? 0 : maxScore;
+
+    int result = (maxScore == INT_MIN) ? 0 : maxScore;
+    _whiteKingMoved = savedWKM; _blackKingMoved = savedBKM;
+    _whiteRookAFileMoved = savedWRA; _whiteRookHFileMoved = savedWRH;
+    _blackRookAFileMoved = savedBRA; _blackRookHFileMoved = savedBRH;
+    _enPassantSquare = savedEP;
+    return result;
 }
 
 void Chess::updateAI()
@@ -843,7 +1268,8 @@ void Chess::updateAI()
     if (!gameHasAI() || !_grid) return;
     
     std::string state = stateString();
-    int depth = 3; // Depth of 3 as required
+    stateStringToBitboards(state); // Root synchronization for deterministic search.
+    int depth = _searchDepth;
     
     int bestScore = INT_MIN;
     
@@ -851,19 +1277,24 @@ void Chess::updateAI()
     char aiColor = (aiPlayerNum == 0) ? 'w' : 'b';
     char opponentColor = (aiPlayerNum == 0) ? 'b' : 'w';
     
-    std::vector<BitMove> moves = generateAllMoves();
+    std::vector<BitMove> moves = generateAllMovesFromBitboards(state, aiColor, true);
     
     // If no moves available, return
     if (moves.empty()) return;
     
     for (const auto& move : moves) {
-        // Make move on state
-        std::string testState = state;
-        testState[move.to] = testState[move.from];
-        testState[move.from] = '0';
-        
-        // Negamax with alpha-beta pruning
-        int score = -negamax(testState, depth - 1, INT_MIN + 1, INT_MAX, opponentColor);
+        std::string testState = applyMoveToState(state, move, aiColor);
+
+        NodeSearchState beforeMove = captureNodeSearchState();
+        applyMoveToBitboards(move, aiPlayerNum);
+
+        // Negamax with alpha-beta pruning + legal move generation.
+        int score = -negamax(testState, depth - 1, INT_MIN + 1, INT_MAX, opponentColor,
+                             _whiteKingMoved, _blackKingMoved,
+                             _whiteRookAFileMoved, _whiteRookHFileMoved,
+                             _blackRookAFileMoved, _blackRookHFileMoved,
+                             _enPassantSquare, 1);
+        restoreNodeSearchState(beforeMove);
         
         if (score > bestScore) {
             bestScore = score;
