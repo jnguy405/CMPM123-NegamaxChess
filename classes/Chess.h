@@ -74,7 +74,7 @@ private:
                                                    bool legalOnly = true);
 
     // Move generation
-    void addPawnBitboardMovesToList(std::vector<BitMove>& moves, uint64_t bitboard, int shift);
+    void addPawnBitboardMovesToList(std::vector<BitMove>& moves, uint64_t bitboard, int shift, uint8_t baseFlags);
     void generatePawnMoves(std::vector<BitMove>& moves, char color);
     void generatePieceMoves(std::vector<BitMove>& moves, char color, ChessPiece pieceType, uint64_t(*attackFn)(int, uint64_t));
     void generateCastlingMoves(std::vector<BitMove>& moves, char color);
@@ -107,6 +107,17 @@ private:
     int _killerFrom[16][2];
     int _killerTo[16][2];
     int _historyHeuristic[64][64];
+
+    // Draw rules to prevent infinite shuffling
+    // 50-move rule: half-moves since the last pawn move or capture.
+    int _halfMoveClock;
+
+    // Threefold repetition: map from position key -> occurrence count.
+    std::unordered_map<std::string, int> _repetitionCounts;
+
+    void updateHalfMoveClock(const BitMove& move);
+    std::string repetitionKey();
+    void resetDrawRulesState();
 
     // Compact container for the search node's mutable state so we can snapshot/
     // restore in one call (reduces duplicate save/restore code in negamax).
